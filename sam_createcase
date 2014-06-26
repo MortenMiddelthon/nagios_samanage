@@ -1,0 +1,343 @@
+#!/usr/bin/perl 
+
+use strict;
+use warnings;
+use Getopt::Long;
+use XML::LibXML;
+use DBI();
+use Config::IniFiles;
+
+
+# Location of config file
+my $config_file = "./config.ini";
+# Read config file
+my $cfg = Config::IniFiles->new( -file => "$config_file" ) or die "Can't open config file!\n";
+
+# Set debug output variable. 0 = off, 1 = on
+my $debug = 1;
+my $debug_log = $cfg->val('logging','debug_log');
+if($debug) {
+	open(DEBUG, ">> $debug_log") or die "Can't open $debug_log for writing!\n";
+}
+
+# curl settings
+my $curl = $cfg->val('curl','curl_path');
+my $timeout = $cfg->val('curl','curl_timeout');
+if(!-x $curl)
+	die "Please install curl.\napt-get install curl\n";
+}
+
+# Command line parameters from nagios
+my $hostname = "";
+my $type = "";
+my $state = "";
+my $address = "";
+my $output = "";
+my $date = "";
+
+# Command file for nagios
+my $cmdfile = $cfg->val('nagios','nagios_cmd');
+
+# For services
+my $service = "";
+my $hostalias = "";
+
+my $result = GetOptions(
+	'hostname=s' => \$hostname,
+	'type=s' => \$type,
+	'state=s' => \$state,
+	'address=s' => \$address,
+	'output=s' => \$output,
+	'date=s' => \$date,
+	'service=s' => \$service,
+	'hostalias=s' => \$hostalias,
+	);
+
+# Connect to MySQL
+# Database connection settings
+my $db_name = $cfg->val('db','db_db');
+my $db_username = $cfg->val('db', 'db_user');
+my $db_password = $cfg->val('db', 'db_pwd');
+my $db_host = $cfg->val('db', 'db_host');
+my $db_table = $cfg->val('db', 'db_table');
+
+my $dbh = DBI->connect("DBI:mysql:database=$db_name;host=$db_host",
+                                "$db_username", "$db_password",
+                                {'RaiseError' => 1});
+
+# Set username/password for SAM
+my $username = $cfg->val('SAM','username');
+my $password = $cfg->val('SAM','password');
+# Set SAM customer name
+my $customer = $cfg->('SAM', 'customer');
+my $default_assignee = $cfg->('SAM','default_assignee');
+
+
+&check_nagios();
+
+# Check nagios for existing incidents
+sub check_nagios {
+	my $incident_query = "";
+	if($service eq "") {
+		$incident_query = "select * from incidents where hostname like '$hostname' and service like ''";
+	}
+	else {
+		$incident_query = "select * from incidents where hostname like '$hostname' and service like '$service'";
+	}
+	my $q = $dbh->prepare($incident_query);
+	$q->execute;
+	# If existing incident is found, update
+	my $num = $q->rows;
+	if($num > 0) {
+		if($debug) {
+			print DEBUG "Found existing incident. Updating...\n";
+			print DEBUG "Host: $hostname - Service: $service\n";
+		}
+		my $sam_id = 0;
+		while(my $data = $q->fetchrow_hashref) {
+			$sam_id = $data->{'sam_incident_id'};
+		}
+		$q->finish;
+		&update($sam_id);
+
+	}
+	# Else create new incident
+	elsif($type eq "PROBLEM") {
+		if($debug) {
+			print DEBUG "Creating new incident...\n";
+		}
+		$q->finish;
+		&create_new();
+	}
+	else {
+		if($debug) {
+			print DEBUG "Type RECOVERY, but no existing incident was found.\n";
+		}
+	}
+}
+
+sub update {
+	my $sam_incident_id = shift;
+	my $xml = "";
+	if($type eq "RECOVERY") {
+		# Add comment to incident before closing
+		&add_incident_comment($sam_incident_id);
+		# Remove nagios comment
+		if($debug) {
+			print DEBUG "Getting nagios comment id and deleting comment...\n";
+		}
+		my $nagios_comment_id = &get_nagios_comment_id($sam_incident_id); 
+		&del_nagios_comment($nagios_comment_id);
+		# Remove incident record in database
+		my $query_remove = "delete from incidents where sam_incident_id = $sam_incident_id";
+		if($debug) {
+			print DEBUG "Remote incident query: $query_remove\n";
+		}
+		my $q_remove = $dbh->prepare($query_remove);
+		$q_remove->execute;
+		$q_remove->finish;
+		# Resolve incident
+		my $output = `$curl -k --digest -u "$username:$password" -d "<incident><state>resolved</state></incident>" -H "Content-Type:text/xml" -X PUT "https://$customer.samanage.com/incidents/$sam_incident_id.xml"`;
+		if($debug) {
+			print DEBUG "State resolved output:\n $output\n";
+		}
+	}
+}
+
+sub create_new {
+	my $incident_name = "";
+	my $incident_desc = "";
+
+	my $machineid = 0;
+	my $asset_xml = "";
+	$machineid = &get_machineid();
+	if($machineid != 0) {
+		$asset_xml = " <assets><asset><id>$machineid</id></asset></assets>";
+	}
+
+	if($service eq "") {
+		$incident_name = "$hostname - $state";
+		$incident_desc = "$hostname - $state - $output";
+	}
+	else {
+		$incident_name = "$hostname - $service - $state";
+		$incident_desc = "$hostname - $service - $state - $output";
+	}
+	my $xml = "";
+	if($asset_xml ne "") {
+		$xml = "
+<incident>
+	<name>nagios problem: $incident_name</name>
+	<priority>medium</priority>
+	<type>incident</type>
+	<requester><email>$username</email></requester>
+	<description>$incident_desc</description>
+	<assignee><email>$default_assignee</email></assignee>
+	$asset_xml
+</incident>";
+	}
+	else {
+	$xml = "
+<incident>
+	<name>nagios problem: $incident_name</name>
+	<priority>medium</priority>
+	<type>incident</type>
+	<requester><email>$username</email></requester>
+	<description>$incident_desc</description>
+	<assignee><email>$default_assignee</email></assignee>
+</incident>";
+	}
+	# Post XML to SAM	
+	my $output = `$curl -k -m $timeout --digest -u '$username:$password' -d '$xml' -H 'Accept: application/xml' -H 'Content-Type:text/xml' -X POST https://$customer.samanage.com/incidents.xml `;
+	if($debug) {
+		print DEBUG "$curl -k -m $timeout --digest -u '$username:$password' -d '$xml' -H 'Accept: application/xml' -H 'Content-Type:text/xml' -X POST https://$customer.samanage.com/incidents.xml\n";
+		print DEBUG "XML: ###############################\n$xml\n################################\n";
+		print DEBUG "$output\n";
+	}
+	# Check if the server reply contains a valid XML output. If not exit	
+	if(!grep(/<\?xml version="1.0"/, $output)) {
+		if($debug) {
+			print DEBUG "No valid XML output received from the server\n";
+		}
+		last;
+	}
+	
+	# Parse XML output from SAM
+	my $parser = XML::LibXML->new();
+	my $doc    = $parser->parse_string( $output);
+
+	foreach my $incident ($doc->findnodes('/incident')) {
+		my($id) = $incident->findnodes('./id');
+		my($href) = $incident->findnodes('./href');
+		my($number) = $incident->findnodes('./number');
+		my $p_id = $id->to_literal;
+		my $p_href = $href->to_literal;
+		my $p_number = $number->to_literal;
+		# Add incident to MySQL DB - SAM - incidents
+		my $query = "insert into incidents (sam_incident_id, hostname, service, href) values ($p_id, \"$hostname\", \"$service\", \"$p_href\")";
+		if($debug) {
+			print DEBUG "MySQL insert incident query: $query\n";
+		}
+		my $q_add = $dbh->prepare($query);
+		$q_add->execute;
+		$q_add->finish;
+		# Add nagios comment
+		&add_nagios_comment("SAM Incident number: ($p_id) #$p_number");
+	}
+}
+
+# Add nagios comment
+sub add_nagios_comment {
+	my $comment = shift;
+	open(CMD, ">> $cmdfile") or die "Can't open $cmdfile for writing! Exiting.\n";
+	my $now = time;
+	if($service eq "") {
+		print CMD "[$now] ADD_HOST_COMMENT;$hostname;1;Nagios;$comment\n";
+	}
+	else {
+		print CMD "[$now] ADD_SVC_COMMENT;$hostname;$service;1;Nagios;$comment\n";
+	}
+	close CMD;
+}
+
+# Delete nagios comment
+sub del_nagios_comment {
+	my $nagios_comment_id = shift;
+	open(CMD, ">> $cmdfile") or die "Can't open $cmdfile for writing! Exiting.\n";
+	my $now = time;
+	if($service eq "") {
+		print CMD "[$now] DEL_HOST_COMMENT;$nagios_comment_id\n";
+	}
+	else {
+		print CMD "[$now] DEL_SVC_COMMENT;$nagios_comment_id\n";
+	}
+	close CMD;
+}
+
+
+sub get_nagios_comment_id {
+	my $sam_id = shift;
+	my $internal_comment_id = 0;
+	# Connect to MySQL
+	# DB settings
+	my $ndo_host = $cfg->val('db','db_ndo_host');
+	my $ndo_name = $cfg->val('db','db_ndo_db');
+	my $ndo_table = $cfg->val('db','db_ndo_table');
+	my $ndo_username = $cfg->val('db','db_ndo_username');
+	my $ndo_password = $cfg->val('db','db_ndo_password');
+	
+	my $dbh_nagios = DBI->connect("DBI:mysql:database=$ndo_name;host=$ndo_host",
+	                                "$ndo_username", "$ndo_password",
+	                                {'RaiseError' => 1});
+	my $query_comments = "select internal_comment_id from nagios_comments where comment_data like 'SAM Incident number: ($sam_id)%'";
+	if($debug) {
+		print DEBUG "Nagios ndoutils query: $query_comments\n";
+	}
+	my $q_comments = $dbh_nagios->prepare($query_comments);
+	$q_comments->execute();
+	while(my $data_comment = $q_comments->fetchrow_hashref) {
+		$internal_comment_id = $data_comment->{'internal_comment_id'};
+	}
+	$q_comments->finish();
+	$dbh_nagios->disconnect();
+	return $internal_comment_id;
+}
+
+$dbh->disconnect;
+
+if($debug) {
+	close DEBUG;
+}
+
+# Get machine ID from hardware table
+sub get_machineid {
+	my $machineid = 0;
+	# convert hostname to uppercase shortname
+	my $shortname = $hostname;
+	if($shortname =~ /^(.*?)\./) {
+		$shortname = uc $1;
+	}
+	my $query_hw = "select distinct name, sam_id from hardware where name like \"$shortname%\"";
+	if($debug) {
+		print DEBUG "Get hardware ID: $query_hw\n";
+	}
+	my $q_hw = $dbh->prepare($query_hw);
+	$q_hw->execute();
+	while(my $data_hw = $q_hw->fetchrow_hashref) {
+		$machineid = $data_hw->{'sam_id'};
+	}
+	$q_hw->finish();
+	return $machineid;
+}
+
+sub add_incident_comment {
+	my $sam_incident_id = shift;
+	if(!defined $sam_incident_id) {
+		print "add incident comment: no ID defined!\n";
+		last;
+	}
+	my $xml = "
+	<comment>
+	<body>
+	$date
+	$output
+	</body>
+	<is_private>0</is_private>
+	</comment>
+	";
+	# Post XML to SAM	
+	if($debug) {
+		print DEBUG "$curl -k -m $timeout --digest -u '$username:$password' -d '$xml' -k -H \"Content-Type:text/xml\" -X POST \"https://$customer.samanage.com/incidents/$sam_incident_id/comments.xml\"";
+	}
+	my $output = `$curl -k -m $timeout --digest -u '$username:$password' -d '$xml' -k -H "Content-Type:text/xml" -X POST "https://$customer.samanage.com/incidents/$sam_incident_id/comments.xml"`;
+	if($debug) {
+		print DEBUG "$output\n";
+	}
+	# Check if the server reply contains a valid XML output. If not exit	
+	if(!grep(/<\?xml version="1.0"/, $output)) {
+		if($debug) {
+			print DEBUG "add incident comment: No valid XML output received from the server\n";
+		}
+		last;
+	}
+}
