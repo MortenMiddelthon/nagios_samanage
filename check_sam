@@ -1,0 +1,66 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Config::IniFiles;
+use Time::HiRes qw(gettimeofday tv_interval);
+
+# Check for curl
+if(!-x "/usr/bin/curl") {
+	die "Please install curl.\napt-get install curl\n";
+}
+
+# SAM URL
+my $url = "https://app.samanage.com/incidents.xml?per_page=1";
+
+# Location of config file
+my $config_file = "./config.ini";
+# Read config file
+my $cfg = Config::IniFiles->new( -file => "$config_file" ) or die "Can't open config file!\n";
+
+
+# Default value for response timeout
+my $response_warning = 10;
+my $response_critical = 15;
+# Timeout value for curl
+my $timeout = $response_critical + 5;
+
+my $result = GetOptions ("response_warning=i" => \$response_warning, "response_critical=i" => \$response_critical);
+
+# Set username/password for SAM
+my $username = $cfg->val('SAM','username');
+my $password = $cfg->val('SAM','password');
+
+my $t0 = [gettimeofday];
+my $output = `/usr/bin/curl --insecure -m $timeout --digest -u "$username:$password" -H "Accept: application/vnd.samanage.v1+xml" -X GET $url`;
+my $elapsed = tv_interval($t0);
+
+my $perfdata = "| response=${elapsed}s;$response_warning;$response_critical;0;$timeout\n";
+
+if(grep(/<\?xml/, $output) and $elapsed < $response_warning) {
+	print "OK: Communication with SAM working as normal. ($elapsed s)\n";
+	print "$output\n";
+	print $perfdata;
+	exit 0;
+}
+
+elsif(grep(/<\?xml/, $output) and $elapsed > $response_warning) {
+	print "WARNING: Communication with SAM is slow. ($elapsed s)\n";
+	print "$output\n";
+	print $perfdata;
+	exit 1;
+}
+
+elsif(grep(/<\?xml/, $output) and $elapsed > $response_critical) {
+	print "CRITICAL: Communication with SAM is slow. ($elapsed s)\n";
+	print "$output\n";
+	print $perfdata;
+	exit 2;
+}
+else {
+	print "CRITICAL: Communication with SAM failed ($elapsed s)\n";
+	print "$output\n";
+	print $perfdata;
+	exit 2;
+}
