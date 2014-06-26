@@ -58,3 +58,10 @@ Nagios setup:
 =============
 See the included nagios.cfg for examples of command, service and contact definitions.
 Make sure the paths and configuration values match your nagios setup
+
+The import script expects some directories to be created under your nagios base configuration. F.ex
+
+% cd /etc/nagios3 && mkdir -p import/hosts import/services import/templates import/cache
+
+The script uses a template file to create nagios host objects, host.tpl. Make sure this file
+is located in your import/templates/ directory
