@@ -1,0 +1,441 @@
+#!/usr/bin/perl 
+
+use strict;
+use warnings;
+use XML::LibXML;
+use DBI();
+use POSIX;
+use Config::IniFiles;
+
+# Location of config file
+my $config_file = "./config.ini";
+# Read config file
+my $cfg = Config::IniFiles->new( -file => "$config_file" ) or die "Can't open config file!\n";
+
+# Database connection settings
+my $db_name = $cfg->val('db','db_db');
+my $db_username = $cfg->val('db', 'db_user');
+my $db_password = $cfg->val('db', 'db_pwd');
+my $db_host = $cfg->val('db', 'db_host');
+my $db_table = $cfg->val('db', 'db_table');
+
+# curl settings
+my $curl = $cfg->val('curl','curl_path');
+my $timeout = $cfg->val('curl','curl_timeout');
+if(!-x $curl)
+	die "Please install curl.\napt-get install curl\n";
+}
+
+# turn on/off debug output
+my $debug = $cfg->val('debug', 'level');
+if(!defined $debug or $debug eq "") {
+	$debug = 0;
+}
+
+# SAM connection settings
+my $username = $cfg->val('SAM', 'username');
+my $password = $cfg->val('SAM', 'password');
+my $URL = $cfg->val('SAM', 'URL');
+
+# Where to store nagios config
+my $nagios_home = $cfg->val('nagios', 'nagios_home');
+my $hostdir = "$nagios_home/import/hosts";
+my $servdir = "$nagios_home/import/services";
+my $tpldir = "$nagios_home/import/templates";
+my $cachedir = "$nagios_home/import/cache";
+# check that directories exist
+if(!-d $hostdir or !-d $servdir or !-d $tpldir) {
+	die "Can't open $hostdir or $servdir!\n";
+}
+# Update this file after succesful import
+my $updatefile = "$nagios_home/import/lastimport";
+
+# set the parents / network gateways
+# based in the IP address of a host set the parent
+# please change these to match your setup
+my %parents = (
+	"10.0.0" => "<network parent 1>",
+	"10.10.0" => "<network parent 2>",
+	);
+
+# Static defined nagios hosts
+# if you have any statically defined nagios hosts, 
+# please define the configuration here
+my $nagios_host_config = "$nagios_home/hosts.cfg";
+my @nagios_hosts = ();
+print "Check static nagios hosts...\n";
+&read_nagios_config();
+
+# Connect to DB
+my $dbh = DBI->connect("DBI:mysql:database=$db_name;host=$db_host",
+                                "$db_username", "$db_password",
+                                {'RaiseError' => 1});
+
+print "Delete old rows from hardware table...\n";
+my $q_delete = $dbh->prepare("delete from $db_table");
+$q_delete->execute();
+$q_delete->finish();
+
+my $count = 0;
+
+# Count how many servers we have imported
+my $count_servers = 0;
+
+&get_hardwares();
+
+sub get_hardwares {
+	my $page_number = 1;
+	print "Get hardwares.xml for samanage.com page $page_number....\n";
+	my $output = `curl --digest -u '$username:$password' -H "Accept: application/vnd.samanage.v1+xml" -X GET "$URL"`;
+	my $parser = XML::LibXML->new();
+	# Remove () from XML output
+	$output =~ s/[\(\)]//g;
+	my $doc    = $parser->parse_string($output);
+	my($page) = ($doc->findnodes('/hardwares/page'));
+	my($per_page) = ($doc->findnodes('/hardwares/per_page'));
+	my($total_entries) = ($doc->findnodes('/hardwares/total_entries'));
+	chomp(my $p_page = $page->to_literal);
+	chomp(my $p_per_page = $per_page->to_literal);
+	chomp(my $p_total_entries = $total_entries->to_literal);
+	print "Page: $p_page\n";
+	print "Per page: $p_per_page\n";
+	print "Total entries: $p_total_entries\n";
+	&import_servers($output, $page_number);
+	my $pages = ceil($p_total_entries / $p_per_page);
+	print "Number of pages: $pages\n";
+	if($pages > 1) {
+		for($page_number = 2; $page_number <= $pages; $page_number++) {
+			$output = `curl --digest -u '$username:$password' -H "Accept: application/vnd.samanage.v1+xml" -X GET "$URL&page=$page_number"`;
+			&import_servers($output, $page_number);
+		}
+	}
+}
+
+sub import_servers {
+	my $output = shift;
+	my $page = shift;
+	my $parser = XML::LibXML->new();
+	my $doc    = $parser->parse_string($output);
+	# Site name
+	my $site = "";
+	print "Parse XML output from page $page ....\n";
+	foreach my $server ($doc->findnodes('/hardwares/hardware')) {
+		$count_servers++;
+		print "Import server # $count_servers\n";
+		my($name) = $server->findnodes('./name');
+		my($id) = $server->findnodes('./id');
+		my($href) = $server->findnodes('./href');
+		my($category) = $server->findnodes('./category/name');
+		my($location) = $server->findnodes('./site/location');
+		my($location_name) = $server->findnodes('./site/name');
+		my($os) = $server->findnodes('./operating_system');
+		my($function) = $server->findnodes('./custom_fields_values/Function');
+		chomp(my $p_id = $id->to_literal);
+		chomp(my $p_name = $name->to_literal);
+		chomp(my $p_href = $href->to_literal);
+		print "Host: $p_name\n";
+		my($ip) = $server->findnodes('./ip');
+		my($model) = $server->findnodes('./model');
+		chomp(my $p_ip = $ip->to_literal);
+		chomp(my $p_model = $model->to_literal);
+		print "	IP: $p_ip\n";
+		print "	Model: $p_model\n";
+
+		$p_href =~ s/\.xml//;
+		if(!defined $p_ip) {
+			print "Server $p_name has no defined IP address. Skipping...\n";
+			next;
+		}
+		my $p_category = "";
+		# Only import servers
+		if(defined $category) {
+			chomp($p_category = $category->to_literal);
+			if($p_category eq "Workstation" or $p_category eq "Macintosh") {
+				next;
+			}
+		}
+		my $p_location = "";
+		if(defined $location) {
+			chomp($p_location = $location->to_literal);
+		}
+		my $p_os = "";
+		if(defined $os) {
+			$p_os = $os->to_literal;
+		}
+		my $p_function = "";
+		if(defined $function) {
+			$p_function = $function->to_literal;
+			print "	Function: $p_function\n";
+		}
+		# add host to database
+		my $query = "replace into hardware (sam_id,name,ip,category,location,os,function) values ($p_id, \"$p_name\", \"$p_ip\", \"$p_category\", \"$p_location\", \"$p_os\", \"$p_function\")";
+		my $q = $dbh->prepare($query);
+		$q->execute;
+		$q->finish;
+		if(grep(/$p_name/, @nagios_hosts)) {
+			print "Found static definition for $p_name in nagios config. Skipping...\n";
+			next;
+		}
+		# Define which group server belongs to based on hostname
+		my $group = "";
+		if($p_name =~ /^(...)-/) {
+			$group = lc $1;
+		}
+		# create nagios config for host
+		# use passive template for external hosts
+		my $template = &read_template("$tpldir/host.tpl");
+		$template =~ s/HOSTNAME/$p_name/g;
+		$template =~ s/DESC/$p_function/;
+		$template_passive =~ s/HOSTNAME/$p_name/g;
+		$template_passive =~ s/DESC/$p_function/;
+		$template =~ s/ADDRESS/$p_ip/g;
+		$template_passive =~ s/ADDRESS/$p_ip/g;
+		# set which hostgroups host belongs to
+		my $hostgroups = "";
+		$template =~ s/TEMPLATE/generic-host/g;
+		$template_passive =~ s/TEMPLATE/generic-host/g;
+		# Hardware based settings
+		# Only meant as an example
+		if(grep(/ProLiant/, $p_model) and &check_hp($p_ip)) {
+			print "	Found HP management agent.\n";
+			$hostgroups .= "hp_servers,";
+		}
+		# OS based settings
+		if(grep(/Windows Server/, $p_os)) {
+			$template =~ s/OPERATINGSYSTEM/$p_os/g;
+			$template =~ s/IMAGE/win40/g;
+			$template =~ s/#//g;
+			$template_passive =~ s/OPERATINGSYSTEM/$p_os/g;
+			$template_passive =~ s/IMAGE/win40/g;
+			$template_passive =~ s/#//g;
+			# check if nsclient is running
+			if(&check_nsclient($p_ip)) {
+				print "	Found nsclient\n";
+				$hostgroups .= "windows_servers,${group}_servers,";
+				if($p_function eq "Hyper V Server") {
+					$hostgroups .= "hyper_v_servers,";
+				}
+				if($p_function eq "Domain Controller") {
+					$hostgroups .= "domain_controllers,";
+				}
+				if($p_function eq "Exchange Server") {
+					$hostgroups .= "exchange_servers,";
+				}
+			}
+		}
+		elsif(grep(/Debian/, $p_os)) {
+			$template =~ s/OPERATINGSYSTEM/$p_os/g;
+			$template =~ s/IMAGE/debian/g;
+			$template =~ s/#//g;
+			$template_passive =~ s/OPERATINGSYSTEM/$p_os/g;
+			$template_passive =~ s/IMAGE/debian/g;
+			$template_passive =~ s/#//g;
+		}
+		# category based settings for virtual servers
+		if($p_category eq "VM: VMWare" and $p_location ne "Offshore") {
+			$hostgroups .= "vmware_vms,";
+		}
+		if($p_category eq "VM: VMWare" and $p_name =~ /MAG-/ and $p_name ne "MAG-WELLVIEW") {
+			$hostgroups .= "vmware_vms_mag,";
+		}
+		if($p_category eq "VM: VMWare" and $p_name =~ /AKB-/) {
+			$hostgroups .= "vmware_vms_akb,";
+		}
+		$template =~ s/HOSTGROUPS/$hostgroups/g;
+		$template_passive =~ s/HOSTGROUPS/$hostgroups/g;
+		# get network parents
+		foreach my $key (keys %parents) {
+			if(grep(/$key/, $p_ip)) {
+				$template =~ s/PARENTS/$parents{$key}/g;
+				$template_passive =~ s/PARENTS/$parents{$key}/g;
+			}
+		}
+		# Delete unused PARENTS
+		$template =~ s/PARENTS//g;
+		$template_passive =~ s/PARENTS//g;
+		# Add HREF to notes_url
+		if(defined $p_href) {
+			$template =~ s/NOTES/$p_href/g;
+			$template_passive =~ s/NOTES/$p_href/g;
+		}
+		else {
+			$template =~ s/NOTES//g;
+			$template_passive =~ s/NOTES//g;
+		}
+		# Write nagios configuration file for host
+		open(HOST, "> $hostdir/$p_name.cfg") or die "Can't open $hostdir/$p_name.cfg for writing!\n";
+		print HOST $template;
+		close HOST;
+		$count++;
+	}
+}	
+$dbh->disconnect;
+
+print "Import $count machines into nagios and hardware database.\n";
+system("touch $updatefile");
+
+# read in nagios templates
+sub read_template {
+	my $tpl = shift;
+	if(!defined $tpl) {
+		return 0;
+	}
+	open(TPL, $tpl) or return 0;
+	my $output = "";
+	while(<TPL>) {
+		$output .= $_;
+	}
+	close TPL;
+	return $output;
+}
+
+# check for existing nagios host config
+sub read_nagios_config {
+	open(NAGIOSCFG, $nagios_host_config) or die "Can't open $nagios_host_config\n";
+	while(<NAGIOSCFG>) {
+		if($_ =~ /^\s*host_name\s*(.*?)$/) {
+			my $hostname = uc $1;
+			print "Nagios host: $hostname\n";
+			push @nagios_hosts, $hostname;
+		}
+	}
+	close NAGIOSCFG;
+}
+
+
+#===  FUNCTION  ================================================================
+#         NAME:  check_nsclient
+#      PURPOSE:  Check if server has got nsclient installed
+#   PARAMETERS:  hostname
+#      RETURNS:  true/false
+#===============================================================================
+sub check_nsclient {
+	my $host = shift;
+	if(!defined $host) {
+		return 0;
+	}
+	if(&check_service($host, "nsclient")) {
+		return 1;
+	}
+	if(-x "/usr/lib/nagios/plugins/check_nrpe") {
+		my $output = `/usr/lib/nagios/plugins/check_nrpe -t 5 -H $host`;
+		chomp $output;
+		if(grep(/seem to be doing fine/, $output)) {
+			# Write to service cache
+			open(CACHESERVICE, "> $cachedir/$host.nsclient");
+			print CACHESERVICE time;
+			print CACHESERVICE "\n";
+			close CACHESERVICE;
+			return 1;
+		}
+		else {
+			return 0;
+		}
+	}
+	else {
+		return 0;
+	}
+}
+
+#===  FUNCTION  ================================================================
+#         NAME:  get_hardware_info
+#      PURPOSE:  Get extended info on server
+#   PARAMETERS:  URL to XML output from samanage.com
+#      RETURNS:  hash table with info
+#===============================================================================
+sub get_hardware_info {
+	my $url = shift;
+	my $ip_address = "";
+	my $model = "";
+	my %hardware_info = ();
+	if(!defined $url) {
+		return 0;
+	}
+	my $username = $cfg->val('SAM','username');
+	my $password = $cfg->val('SAM','password');
+	my $page_number = 1;
+	my $hardware_output = `$curl --silent --digest -u '$username:$password' -H "Accept: application/vnd.samanage.v1+xml" -X GET "$url" |grep -v "Remote Control"`;
+	my $hardware_parser = XML::LibXML->new();
+#	print "URL: $url\n";
+	my $hardware_doc    = $hardware_parser->parse_string($hardware_output);
+	# Get IP addresses
+	foreach my $ip ($hardware_doc->findnodes('./hardware/networks/network')) {
+		chomp(my $address = $ip->findnodes('./ip_address'));
+		chomp(my $gateway = $ip->findnodes('./gateway'));
+		if($gateway !~ /0.0.0.0/) {
+			$ip_address = $address;
+			last;
+		}
+	}
+	# Get hardware model
+	foreach my $bios ($hardware_doc->findnodes('./hardware/bioses/bios')) {
+		chomp(my $model = $bios->findnodes('./model'));
+		chomp(my $manufacturer = $bios->findnodes('./manufacturer'));
+		$hardware_info{"model"} = $model->to_literal;
+		$hardware_info{"manufacturer"} = $manufacturer->to_literal;
+	}
+	$hardware_info{"ip_address"} = $ip_address;
+	return %hardware_info;
+}	
+
+#===  FUNCTION  ================================================================
+#         NAME:  check_service
+#      PURPOSE:  Check if machine has been checked before for nsclient or other services
+#   PARAMETERS:  hostname
+#      RETURNS:  true or false
+#===============================================================================
+sub check_service {
+	my $hostname = shift;
+	my $service = shift;
+	if(!defined $hostname or !defined $service) {
+		return 0;
+	}
+	if($debug) {
+		print "Checking $cachedir/$hostname.$service ...\n";
+	}
+	if(-f "$cachedir/$hostname.$service") {
+		if($debug) {
+			print "	Found cached service definition.\n";
+		}
+		return 1;
+	}
+	else {
+		return 0;
+	}
+}
+
+#===  FUNCTION  ================================================================
+#         NAME:  check_hp
+#      PURPOSE:  Check if server has HP management pack installed
+#   PARAMETERS:  hostname/IP address
+#      RETURNS:  true/false
+#       THROWS:  no exceptions
+#     COMMENTS:  none
+#     SEE ALSO:  n/a
+#===============================================================================
+sub check_hp {
+	my $host = shift;
+	if(!defined $host) {
+		return 0;
+	}
+	if(&check_service($host, "hp")) {
+		return 1;
+	}
+	my $snmpget = "/usr/bin/snmpget -t 5 -v2c -c public";
+	my $oid_hp = ".1.3.6.1.2.1.25.6.3.1.2.20";
+	if($debug) {
+		print "SNMPGET: $snmpget $host $oid_hp\n";
+	}
+	chomp(my $snmp_output = `$snmpget $host $oid_hp 2>&1 `);
+	if(grep(/HP ProLiant Remote Monitor Service/, $snmp_output)) {
+			# Write to service cache
+			open(CACHESERVICE, "> $cachedir/$host.hp");
+			print CACHESERVICE time;
+			print CACHESERVICE "\n";
+			close CACHESERVICE;
+			return 1;
+	}
+	else {
+		return 0;
+	}
+}
