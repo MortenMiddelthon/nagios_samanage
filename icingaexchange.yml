@@ -1,0 +1,48 @@
+name: nagios_samanage
+description: "file:///README.md"
+url: "https://github.com/MortenMiddelthon/nagios_samanage"
+tags: ~
+vendor: Linux
+target: Reporting
+type: Addon
+license: gplv3
+releases: 
+  - 
+      name: 1.0
+      description: "1.0 Release"
+      files: 
+       - 
+          name: check_sam
+          url: "file:///check_sam"
+          description: "Icinga check plugin for checking SAM availabilty"
+          checksum: 6be6d79f3cc99131022b6c79f260d9b5
+       - 
+          name: sam_createcase
+          url: "file:///sam_createcase"
+          description: "Creates incidents with SAM based on icinga events"
+          checksum: 61118f815f489ed7ec4fefa2ce988641
+       - 
+          name: sam_get_hardware
+          url: "file:///sam_get_hardware"
+          description: "Import inventory into MySQL/MariaDB database"
+          checksum: 739e83b5ebadb425c0c84ea1826929c3
+       - 
+          name: SAM.sql
+          url: "file:///SAM.sql"
+          description: "Database definition"
+          checksum: 897688d2c08cbf8e43ab47623b1eb853
+       - 
+          name: host.tpl
+          url: "file:///host.tpl"
+          description: "Icinga host object template for sam_get_hardware"
+          checksum: ebb873f4397567a4149ae2b00fbde12b
+       - 
+          name: nagios.cfg
+          url: "file:///nagios.cfg"
+          description: "Icinga example configuration"
+          checksum: 8c0c927cde1b902246ece1bd4e9f1dd1
+       - 
+          name: config.default.ini
+          url: "file:///config.default.ini"
+          description: "Config file for perl scripts. Must be renamed to config.ini"
+          checksum: 5d6ae37c513f42cc28cbd2fc6e5e5489
