@@ -23,13 +23,18 @@ Nagios 3.x or Icinga
 
 Installation on Debian:
 =======================
-apt-get -y install libconfig-inifiles-perl  libdbi-perl  libxml-libxml-perl  libtimedate-perl  libdbd-mysql-perl  mysql-clientmysql-common  mysql-server  ndoutils-nagios3-mysql  nagios3  nagios3-cgi  nagios3-common  nagios3-core
+
+```bash
+$ sudo apt-get -y install libconfig-inifiles-perl  libdbi-perl  libxml-libxml-perl  libtimedate-perl  libdbd-mysql-perl  mysql-clientmysql-common  mysql-server  ndoutils-nagios3-mysql  nagios3  nagios3-cgi  nagios3-common  nagios3-core
+```
 
 Initial configuration:
 ======================
 Copy the default configuration file to a local version:
 
-% cp config.default.ini config.ini
+```bash
+$ cp config.default.ini config.ini
+```
 
 Go through the settings and make sure they match your local
 environment
@@ -39,11 +44,13 @@ Database setup:
 The scripts uses two databases. One database called 'SAM' which stores information retrieved from SAM. 
 See the included SAM.sql for a complete database dump:
 
-% mysqladmin -uroot -p create SAM
+```bash
+$ mysqladmin -uroot -p create SAM
 
-% mysql -uroot -p SAM < SAM.sql
+$ mysql -uroot -p SAM < SAM.sql
 
-% mysql -e 'grant all on SAM.* to SAM@localhost identified by "yoursecretpassword"' -uroot -p
+$ mysql -e 'grant all on SAM.* to SAM@localhost identified by "yoursecretpassword"' -uroot -p
+```
 
 The username and password defined in the statement above must be stored on your
 config.ini
@@ -52,7 +59,9 @@ The second the database is the one created by NDOUtils. The script only needs re
 the comments table, f.ex nagios_comments. The values needed to connect to the ndoutils database
 is defined in the config.ini:
 
-% mysql -e 'grant select on ndoutils.nagios_comments to nagios@localhost identified by 'yoursecretpassword' -uroot -p
+```bash
+% mysql -e 'grant select on ndoutils.nagios_comments to nagios@localhost identified by "yoursecretpassword"' -uroot -p
+```
 
 Nagios setup:
 =============
@@ -61,7 +70,9 @@ Make sure the paths and configuration values match your nagios setup
 
 The import script expects some directories to be created under your nagios base configuration. F.ex
 
-% cd /etc/nagios3 && mkdir -p import/hosts import/services import/templates import/cache
+```bash
+$ cd /etc/nagios3 && mkdir -p import/hosts import/services import/templates import/cache
+```
 
 The script uses a template file to create nagios host objects, host.tpl. Make sure this file
 is located in your import/templates/ directory
