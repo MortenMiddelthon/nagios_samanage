@@ -60,7 +60,7 @@ the comments table, f.ex nagios_comments. The values needed to connect to the nd
 is defined in the config.ini:
 
 ```bash
-% mysql -e 'grant select on ndoutils.nagios_comments to nagios@localhost identified by "yoursecretpassword"' -uroot -p
+$ mysql -e 'grant select on ndoutils.nagios_comments to nagios@localhost identified by "yoursecretpassword"' -uroot -p
 ```
 
 Nagios setup:
